@@ -74,7 +74,7 @@ class Seq2seqSequentialDataset(data.Dataset):
                 continue
             inv_ids = [self.tokenizer.bos_token_id] + self.tokenizer.encode(story) + [self.tokenizer.sep_token_id] + self.tokenizer.encode(title) + [self.tokenizer.eos_token_id]
             self.sequence_buffer[self.size, 0:len(ids)] = torch.tensor(ids)
-            self.inverse_sequence_buffer[self.size, 0:len(ids)] = torch.tensor(ids)
+            self.inverse_sequence_buffer[self.size, 0:len(ids)] = torch.tensor(inv_ids)
             self.length_buffer[self.size] = len(ids) - 1
             self.inv_length_buffer[self.size] = len(inv_ids) - 1
             self.size += 1

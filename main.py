@@ -74,7 +74,7 @@ class YAKEKeywordSequentialDataset(data.Dataset):
                 continue
             inv_ids = [self.tokenizer.bos_token_id] + self.tokenizer.encode(" ".join(keywords_sorted)) + [self.tokenizer.sep_token_id] + self.tokenizer.encode(title) + [self.tokenizer.eos_token_id]
             self.sequence_buffer[self.size, 0:len(ids)] = torch.tensor(ids)
-            self.inverse_sequence_buffer[self.size, 0:len(ids)] = torch.tensor(ids)
+            self.inverse_sequence_buffer[self.size, 0:len(inv_ids)] = torch.tensor(inv_ids)
             self.length_buffer[self.size] = len(ids) - 1
             self.inv_length_buffer[self.size] = len(inv_ids) - 1
             self.size += 1
@@ -112,6 +112,13 @@ def main():
         type=str2bool,
         required=False,
         help="load the latest checkpoint and run the eval pipeline.",
+    )
+    parser.add_argument(
+        "--start_server",
+        default=False,
+        type=str2bool,
+        required=False,
+        help="load the latest checkpoint and start the server",
     )
     parser.add_argument(
         "--batch_size",
@@ -157,20 +164,186 @@ def main():
         dataset, batch_size=args.batch_size // args.iter_per, shuffle=True, drop_last=False, pin_memory=True,
         num_workers=8
     )
+
+    def analyze_bnf_likelihood(line, n_fold=10):
+
+        input_ids = torch.tensor(
+            [tokenizer.bos_token_id] + tokenizer.encode(tokenizer.encode("%s" % line.strip())) + [
+                tokenizer.sep_token_id])
+
+        title_ids = input_ids[1:-1]
+        naive_tokenization = line.strip().split()
+        counter = 0
+        ptr = 0
+        collector = []
+        for natural_word in naive_tokenization:
+            while ptr + counter <= len(title_ids):
+                if tokenizer.decode(title_ids[ptr:ptr + counter]).strip() == natural_word:
+                    collector.append((ptr, ptr + counter, natural_word))
+                    ptr = ptr + counter
+                    counter = 0
+                    break
+                else:
+                    counter += 1
+        with torch.no_grad():
+            base_likelihoods = base_model(input_ids.cuda().unsqueeze(dim=0)).logits.log_softmax(dim=-1)[0, 0:-2].gather(
+                dim=-1, index=title_ids.unsqueeze(dim=-1).cuda())
+            generate_storyline = lambda input_ids: \
+                torch.cat((torch.tensor([[tokenizer.bos_token_id]] * n_fold).cuda(),
+                           base_model.generate(input_ids=torch.stack([input_ids.cuda()] * n_fold), max_length=100,
+                                               # num_beams=20,
+                                               do_sample=True, top_p=0.85,
+                                               repetition_penalty=1.05,
+                                               pad_token_id=tokenizer.eos_token_id,
+                                               eos_token_id=tokenizer.sep_token_id)[:, len(input_ids):]), dim=-1)
+            all_likelihoods = []
+            generated_storylines = generate_storyline(input_ids)
+            for i_fold in range(n_fold):
+                generated_storyline = generated_storylines[i_fold]
+                count_pad = (generated_storyline == tokenizer.eos_token_id).to(torch.long).sum().item()
+                if count_pad > 0:
+                    generated_storyline = generated_storyline[0:-count_pad]
+
+                count_pad = (generated_storyline == tokenizer.sep_token_id).to(torch.long).sum().item()
+                if count_pad == 0:
+                    continue
+                likelihoods = inv_model(torch.cat((generated_storyline, title_ids.cuda())).unsqueeze(dim=0)) \
+                                  .logits.log_softmax(dim=-1)[0, len(generated_storyline) - 1:-1] \
+                    .gather(dim=-1, index=title_ids.unsqueeze(dim=-1).cuda())
+                all_likelihoods.append(likelihoods)
+            likelihoods = torch.stack(all_likelihoods).min(dim=0).values
+            adv_likelihoods = (likelihoods - base_likelihoods)
+
+        return [(i, j, w, adv_likelihoods[i:j].sum().item()) for (i, j, w) in collector], \
+               torch.tensor([adv_likelihoods[i:j].sum().item() for (i, j, w) in collector]), \
+               adv_likelihoods.sum()
+    if args.start_server:
+        import gradio as gr
+        base_model.load_state_dict(torch.load("checkpoints/pretrained"))
+        base_model.eval()
+        inv_model.load_state_dict(torch.load("checkpoints/inv_model"))
+        inv_model.cuda(0)
+        inv_model.eval()
+        from difflib import Differ
+
+        demo = gr.Blocks()
+
+        def bnf_label(sens, x):
+            xs = x.strip().split()
+            return_v = []
+            all_label = ["High Risk", "Good", "Warning", ]
+            collector_a, adv_a, red_a = analyze_bnf_likelihood(x.strip(), n_fold=10)
+            for (i, j, x_, value) in collector_a:
+                c = x_
+                if value < sens:
+                    l = "High Risk"
+                elif value < -0.0:
+                    l = "Warning"
+                else:
+                    l = "Good"
+                return_v.append((c, l, value))
+            return_s = []
+            for c, l, value in return_v:
+                if l == "High Risk":
+                    return_s.append("**%s** (I am so confused about this usage)" % c)
+                elif l == "Warning":
+                    return_s.append("*%s* (I don't quite get it, but I think it's fine)" % c)
+                else:
+                    return_s.append("%s (I'm OK with this one)" % c)
+            return "\n\n".join(return_s)
+
+        def generate_storyline(title):
+            input_ids = torch.tensor(
+                [tokenizer.bos_token_id] + tokenizer.encode(tokenizer.encode("%s" % title.strip())) + [
+                    tokenizer.sep_token_id])
+            storyline = base_model.generate(input_ids=torch.stack([input_ids.cuda()]), max_length=100,
+                                # num_beams=20,
+                                do_sample=True, top_p=0.85,
+                                repetition_penalty=1.05,
+                                pad_token_id=tokenizer.eos_token_id,
+                                eos_token_id=tokenizer.sep_token_id)[0, len(input_ids):-1]
+            return tokenizer.decode(storyline)
+
+        def generate_story(title, storyline):
+            input_ids = torch.tensor(
+                [tokenizer.bos_token_id] + tokenizer.encode(tokenizer.encode("%s" % title.strip())) + [
+                    tokenizer.sep_token_id] + tokenizer.encode(tokenizer.encode("%s" % storyline.strip())) + [
+                    tokenizer.sep_token_id])
+            story = base_model.generate(input_ids=torch.stack([input_ids.cuda()]), max_length=400,
+                                # num_beams=20,
+                                do_sample=True, top_p=0.85,
+                                repetition_penalty=1.05,
+                                pad_token_id=tokenizer.eos_token_id,
+                                eos_token_id=tokenizer.eos_token_id)[0, len(input_ids):-1]
+            return tokenizer.decode(story)
+
+
+        with demo:
+            gr.Markdown("Generate your own scary stories using this demo!")
+            with gr.Tabs():
+                with gr.TabItem("Scary Story Generation"):
+                    BNF_helper = gr.Markdown(label="Writing Feedback", interactive=False)
+                    text_input = gr.Textbox(placeholder="Please input your title here", label="Story Title", interactive=True)
+                    BNF_sensitivity = gr.Slider(label="Back-N-Forth Sensitivity", minimum=-50.0, maximum=0.0, value=-5.0)
+                    stage1_button = gr.Button("Run BNF Check of Title", variant="secondary")
+                    stage2_button = gr.Button("Generate Storyline", variant="secondary")
+                    text_storyline = gr.Textbox(label="Storyline", interactive=True)
+                    stage3_button = gr.Button("Generate Story", variant="secondary")
+                    text_output = gr.Textbox(label="Story", lines=20, max_lines=40, interactive=True)
+
+            stage1_button.click(bnf_label, inputs=[BNF_sensitivity, text_input], outputs=BNF_helper)
+            stage2_button.click(generate_storyline, inputs=text_input, outputs=text_storyline)
+            stage3_button.click(generate_story, inputs=[text_input, text_storyline], outputs=text_output)
+
+        demo.launch()
+        exit()
+
     if args.eval_mode:
         base_model.load_state_dict(torch.load("checkpoints/pretrained"))
         base_model.eval()
         inv_model.load_state_dict(torch.load("checkpoints/inv_model"))
+        inv_model.cuda(0)
         inv_model.eval()
-        line = input("Please input title for your scary story:")
-        input_ids = torch.tensor([tokenizer.bos_token_id] + tokenizer.encode(tokenizer.encode("%s"% line.strip())) + [tokenizer.sep_token_id])
-        generated = lambda: base_model.generate(input_ids=input_ids.cuda().unsqueeze(dim=0), max_length=500,
-                                       do_sample=True, top_p=0.80, top_k=10, repetition_penalty=1.2, pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.sep_token_id)
+        # line = input("Please input title for your scary story:")
+
+
+
+
         # generated = base_model.generate(input_ids=input_ids.cuda().unsqueeze(dim=0), max_length=500, beam_size=10, pad_token_id=tokenzier.eos_token_id)
+        with open("corrupted_story_title_spelling.txt", "r") as fin:
+            N, M = 0, 0
+            iterator = tqdm.tqdm(fin.readlines())
+            for line in iterator:
+                M += 1
+                a, b = line.strip().split("\t")
+                collector_a, adv_a, red_a = analyze_bnf_likelihood(a, n_fold=10)
+                collector_b, adv_b, red_b = analyze_bnf_likelihood(b, n_fold=10)
+                try:
+                    if adv_b.min().item() < adv_a.min().item():
+                        N += 1
+                        iterator.write("Spelling Corruption Defense: Detected: %d, All: %d, Acc: %4f" % (N, M, N / M))
+                except:
+                    embed(); exit()
+        print("Summary of Spelling Corruption Defense: Detected: %d, All: %d, Acc: %4f" % (N, M, N / M))
 
-        embed(); exit()
+        with open("corrupted_story_title_confused.txt", "r") as fin:
+            N, M = 0, 0
+            iterator = tqdm.tqdm(fin.readlines())
+            for line in iterator:
+                M += 1
+                a, b = line.strip().split("\t")
+                collector_a, adv_a, red_a = analyze_bnf_likelihood(a, n_fold=10)
+                collector_b, adv_b, red_b = analyze_bnf_likelihood(b, n_fold=10)
+                try:
+                    if adv_b.min().item() < adv_a.min().item():
+                        N += 1
+                        iterator.write("Confusion Corruption Defense: Detected: %d, All: %d, Acc: %4f" % (N, M, N / M))
+                except:
+                    embed(); exit()
+        print("Summary of Confusion Corruption Defense: Detected: %d, All: %d, Acc: %4f" % (N, M, N / M))
+        exit()
 
-    for epoch_idx in range(20):
+    for epoch_idx in range(8):
         iterator = tqdm.tqdm(dataloader)
         F_LOSS = []
         I_LOSS = []
